@@ -532,10 +532,49 @@ def common_pointwise_strategy(
                 out_placements.append(Shard(new_shard_dim))
             elif isinstance(placement, Partial):
                 # note that only partial-sum and partial-avg are supported for linearity
-                partial_supports_linearity = placement.is_partial(
-                    "sum"
-                ) or placement.is_partial("avg")
-                if linearity > 0 and partial_supports_linearity:
+                safe_avoid_redistribution = False
+                if isinstance(placement, _NormPartial):
+                    if (
+                        op
+                        in [
+                            aten.div.Scalar,
+                            aten.div_.Scalar,
+                            aten.mul.Scalar,
+                            aten.mul_.Scalar,
+                        ]
+                        and args_schema[1] >= 0  # pyre-ignore[unsupported-operation]
+                    ):
+                        safe_avoid_redistribution = True
+                        """
+                        Proof:
+                        dt: _NormPartial
+                        rank 0: a₁ b₁
+                        rank 1: a₂ b₂
+                        1.
+                        res = dt * c, where c >= 0
+                        with_redistribution = c√(a₁² + a₂²), c√(b₁² + b₂²)
+                        without redistribution
+                        rank 0: ca₁ cb₁
+                        rank 1: ca₂ cb₂
+                        redistribute = √((ca₁)² + (ca₂)²), √((cb₁)² + (cb₂)²)
+                        = √(c²a₁² + c²a₂²), √(c²b₁² + c²b₂²)
+                        = √(c²(a₁² + a₂²)), √(c²(b₁² + b₂²))
+                        = c√(a₁² + a₂²), c√(b₁² + b₂²)
+                        with_redistribution == redistribute
+                        2.
+                        res = dt * c, where c < 0
+                        with_redistribution = -c√(a₁² + a₂²), -c√(b₁² + b₂²)
+                        without redistribution
+                        rank 0: -ca₁ -cb₁
+                        rank 1: -ca₂ -cb₂
+                        redistribute = √((-ca₁)² + (-ca₂)²), √((-cb₁)² + (-cb₂)²)
+                        = √(c²a₁² + c²a₂²), √(c²b₁² + c²b₂²)
+                        = √(c²(a₁² + a₂²)), √(c²(b₁² + b₂²))
+                        = c√(a₁² + a₂²), c√(b₁² + b₂²)
+                partial_supports_linearity = (
+                    placement.is_partial("sum") or placement.is_partial("avg")
+                ) and safe_avoid_redistribution
+                if linearity >= 0 and partial_supports_linearity:
                     # propagate the partial placement
                     out_placements.append(placement)
                 else:
