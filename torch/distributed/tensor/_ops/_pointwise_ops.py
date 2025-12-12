@@ -12,6 +12,7 @@ from torch.distributed.tensor._op_schema import (
     StrategyType,
     TupleStrategy,
 )
+from torch.distributed.tensor._ops._math_ops import _NormPartial
 from torch.distributed.tensor._ops.registration import register_op_strategy
 from torch.distributed.tensor._ops.utils import (
     generate_redistribute_costs,
@@ -26,6 +27,7 @@ from torch.distributed.tensor.placement_types import (
     Replicate,
     Shard,
 )
+from torch.types import _Number
 from torch.utils._typing_utils import not_none
 
 
@@ -477,6 +479,7 @@ def pointwise_strategy(
         f"no strategy to follow for {op_schema}!"
     )
     return common_pointwise_strategy(
+        op_schema.op,
         op_schema.args_schema,
         followed_strategy,
         followed_strategy_index,
@@ -514,6 +517,7 @@ def partial_preserving_pointwise_strategy(op_schema: OpSchema) -> StrategyType:
 
 
 def common_pointwise_strategy(
+    op,
     args_schema: Sequence[object],
     followed_strategy: OpStrategy,
     followed_strategy_index: int,
@@ -565,14 +569,39 @@ def common_pointwise_strategy(
                 else:
                     out_placements.append(Shard(new_shard_dim))
             elif isinstance(placement, Partial):
+                safe_avoid_redistribution = False
+                is_scalar_arg = False
+                is_non_neg_scalar = False
+                if op in (
+                    redistribute_partial_ops | norm_partial_avoidable_redistribute_ops
+                ):
+                    is_scalar_arg = isinstance(args_schema[1], _Number)
+                    is_non_neg_scalar = (
+                        is_scalar_arg
+                        and args_schema[1] >= 0  # pyre-ignore[unsupported-operation]
+                    )
+
+                if isinstance(placement, _NormPartial):
+                    if (
+                        op in norm_partial_avoidable_redistribute_ops
+                        and is_non_neg_scalar
+                    ):
+                        safe_avoid_redistribution = True
+
+                elif isinstance(placement, Partial):
+                    if op not in redistribute_partial_ops or not is_scalar_arg:
+                        safe_avoid_redistribution = True
+
                 # Check if this partial type should be preserved
                 if preserve_partial is not None and placement.is_partial(
                     preserve_partial
                 ):
                     out_placements.append(placement)
                 # note that only partial-sum and partial-avg are supported for linearity
-                elif linearity >= 0 and (
-                    placement.is_partial("sum") or placement.is_partial("avg")
+                elif (
+                    linearity >= 0
+                    and (placement.is_partial("sum") or placement.is_partial("avg"))
+                    and safe_avoid_redistribution
                 ):
                     # propagate the partial placement
                     out_placements.append(placement)
@@ -620,12 +649,27 @@ def common_pointwise_strategy(
                     common_shape, input_arg_spec.shape
                 )
 
-                # Determine if this input should convert Partial to Replicate base on linearity
+                # Determine if this input should convert Partial to Replicate based on linearity
                 should_convert_partial = (
                     linearity == 2
                     and input_idx
                     != followed_strategy_index  # Don't convert the "followed" strategy
                 )
+
+                # For preserve_partial ops, check if non-followed input has incompatible
+                # Partial type. If so, it must be redistributed to Replicate first.
+                if (
+                    preserve_partial is not None
+                    and input_idx != followed_strategy_index
+                ):
+                    for out_p, in_p in zip(out_placements, input_arg_spec.placements):
+                        if (
+                            isinstance(out_p, Partial)
+                            and isinstance(in_p, Partial)
+                            and out_p != in_p
+                        ):
+                            should_convert_partial = True
+                            break
 
                 input_target_placements = map_placements_after_broadcast(
                     tuple(out_placements),
@@ -657,10 +701,25 @@ def common_pointwise_strategy(
     return pointwise_strategy
 
 
+redistribute_partial_ops = {aten.add.Tensor, aten.add_.Tensor}
+
+
+norm_partial_avoidable_redistribute_ops = {
+    aten.div.Scalar,
+    aten.div_.Scalar,
+    aten.mul.Scalar,
+    aten.mul_.Scalar,
+}
+
 for op in linear_pointwise_ops:
-    register_op_strategy(op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"]))(
-        linear_pointwise_strategy
-    )
+    if op in norm_partial_avoidable_redistribute_ops:
+        register_op_strategy(
+            op, schema_info=RuntimeSchemaInfo(1, static_kwargkey=["out"])
+        )(linear_pointwise_strategy)
+    else:
+        register_op_strategy(
+            op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"])
+        )(linear_pointwise_strategy)
 
 for op in partial_preserving_ops:
     register_op_strategy(op, schema_info=RuntimeSchemaInfo(static_kwargkey=["out"]))(
@@ -792,6 +851,7 @@ def list_pointwise_strategy(
             for arg_strategy in args_strategies
         ]
         pointwise_strategy: OpStrategy = common_pointwise_strategy(
+            op_schema.op,
             args_schema,
             child_strtgy,
             linearity,
