@@ -29,6 +29,7 @@ from .aoti_hipify_utils import maybe_hipify_code_wrapper
 from .common import get_device_op_overrides, IndentedBuffer, Kernel
 from .cpp_utils import cexpr, DEVICE_TO_ATEN, DEVICE_TO_INT, DTYPE_TO_ATEN, DTYPE_TO_CPP
 from .wrapper import (
+    codegen_reinterpret_view_helper,
     EnterSubgraphLine,
     ExitSubgraphLine,
     PythonWrapperCodegen,
@@ -422,7 +423,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
                     from torch.utils._sympy.value_ranges import bound_sympy
 
                     sym_range = bound_sympy(d, V.graph.sizevars.shape_env.var_to_range)
-                    if not math.isinf(sym_range.lower):
+                    if config.aot_inductor.check_lowerbound and not math.isinf(
+                        sym_range.lower
+                    ):
                         self.prefix.splice(
                             f"""
                                 if ({name}_size[{dim_idx}] < {sym_range.lower}) {{
@@ -823,7 +826,19 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 assert isinstance(tensor, torch.Tensor)
                 self.prefix.writeline(f"""constants_info_[{idx}].name = "{name}";""")
                 self.prefix.writeline(
-                    f"constants_info_[{idx}].dtype = static_cast<int32_t>({self.codegen_dtype(tensor.dtype)});"
+                    f"constants_info_[{idx}].dtype = {self.codegen_dtype(tensor.dtype)};"
+                )
+                # Mixed-device constants are only supported when the secondary device is CPU
+                if tensor.device.type != self.device and tensor.device.type != "cpu":
+                    raise AssertionError(
+                        f"Mixed-device constants are only supported when the secondary "
+                        f"device is CPU. Model device is '{self.device}', but constant "
+                        f"'{name}' is on device '{tensor.device}'."
+                    )
+                # device_index is not needed because it can be set at runtime
+                device_type, _ = self.codegen_device(tensor.device).split(", ")
+                self.prefix.writeline(
+                    f"constants_info_[{idx}].device_type = {device_type};"
                 )
                 self.prefix.writeline(
                     f"constants_info_[{idx}].offset = {tensor.storage_offset()};"
@@ -1823,6 +1838,11 @@ class CppWrapperCpu(PythonWrapperCodegen):
         """Returns a newly-created, temporary RAII tensor handle containing the
         reinterpreted tensor data.  Callers of this function are responsible for saving
         the handle if persistent access is needed."""
+
+        d_size, d_stride, d_offset, d_dtype, collapsible = (
+            codegen_reinterpret_view_helper(data)
+        )
+
         dim = str(len(size))
         original_offset = offset
         offset = self.codegen_sizevar(offset)
@@ -1868,13 +1888,21 @@ class CppWrapperCpu(PythonWrapperCodegen):
             ]
             return f"RAIIAtenTensorHandle({tmp_AtenTensorHandle})", tmp_call_strs
 
-        if (
-            size == data.layout.size
-            and stride == data.layout.stride
-            and original_offset == data.layout.offset
-        ):
+        collapsed = collapsible and original_offset == d_offset
+        if collapsed:
+            same_layout = size == d_size and stride == d_stride
+            base_dtype = d_dtype
+        else:
+            same_layout = (
+                size == data.layout.size
+                and stride == data.layout.stride
+                and original_offset == data.layout.offset
+            )
+            base_dtype = data.dtype
+
+        if same_layout:
             # pure dtypeview
-            if dtype is not None and dtype != data.dtype:
+            if dtype is not None and dtype != base_dtype:
                 final_tensor_str, tmp_call_strs = create_dtypeview_call(data.get_name())
             else:
                 final_tensor_str, tmp_call_strs = create_new_tensor_handle()
@@ -1882,8 +1910,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
         else:
             # firstly create reinterpretview
             final_tensor_str = create_reinterpret_call()
-
-            if dtype is not None and dtype != data.dtype:
+            if dtype is not None and dtype != base_dtype:
                 # wrap it with dtypeview
                 final_tensor_str, tmp_call_strs = create_dtypeview_call(
                     final_tensor_str
