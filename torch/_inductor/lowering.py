@@ -7322,6 +7322,19 @@ def cond(
     return list(map(TensorBox.create, result))  # pyrefly: ignore no-matching-overload
 
 
+@register_lowering(torch.ops.higher_order.print, type_promotion_kind=None)
+def print(format_str: str, *args: object, **kwargs: object):
+    from torch._higher_order_ops.print import print as hop_print
+
+    # Use FallbackKernel to handle the HOP print
+    # The C++ and Python backends will handle codegen separately:
+    # - Python: calls torch.ops.higher_order.print() → builtins.print()
+    # - C++: generates native printf() call (handled in cpp_wrapper_cpu.py)
+    ir.FallbackKernel.create(hop_print, format_str, *args, **kwargs)
+    # print returns None
+    return None
+
+
 @register_lowering(torch.ops.higher_order.while_loop, type_promotion_kind=None)
 def while_loop(cond_fn, body_fn, carried_inputs, additional_inputs, stack_output=False):
     # TODO: when graph_partition is enabled, skip - partitioning handles control flow
@@ -7576,10 +7589,31 @@ def with_effects(token, op, *args, **kwargs):
         )
 
     try:
-        args, kwargs = pytree.tree_map_only(
-            ir.TorchBindObject, lambda a: a.get_value(), (args, kwargs)
+
+        def convert_ir_to_value(a):
+            if isinstance(a, ir.TorchBindObject):
+                return a.get_value()
+            elif isinstance(a, TensorBox):
+                # TensorBox wraps StorageBox, which wraps the actual buffer
+                # We need to get the example tensor from the inner buffer
+                try:
+                    storage = a.data
+                    if hasattr(storage, "data") and hasattr(
+                        storage.data, "get_example"
+                    ):
+                        return (
+                            storage.data.get_example()
+                        )  # pyrefly: ignore[missing-attribute]
+                except (AttributeError, NotImplementedError):
+                    pass
+                # Fall back to returning the TensorBox itself if get_example fails
+                return a
+            return a
+
+        schema_args, schema_kwargs = pytree.tree_map(
+            convert_ir_to_value, (args, kwargs)
         )
-        schema = _get_schema(op, args, kwargs)
+        schema = _get_schema(op, schema_args, schema_kwargs)
     except RuntimeError as e:
         error_msg = str(e)
         log.warning(
