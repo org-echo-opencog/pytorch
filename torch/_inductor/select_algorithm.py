@@ -2883,7 +2883,6 @@ class AlgorithmSelectorCache(PersistentCache):
                     )
 
                     return results
-
             else:
 
                 def get_timings(hint_override: Optional[int] = None):
