@@ -263,7 +263,7 @@ def math_attention(
     # for math impl we divide by log(2) because we will multiply by log(2)
 
     return (
-        post_mod_scores.to(query.dtype) @ value,
+        post_mod_scores.to(query.dtype) @ value.to(query.dtype),
         logsumexp / math.log(2),
         max_scores / math.log(2),
     )
@@ -844,6 +844,12 @@ def sdpa_dense_backward(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, tuple[Optional[torch.Tensor], ...]
 ]:
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError(
+            f"Backward pass with mixed query, key, and value dtype is not supported, "
+            f"got query.dtype={query.dtype}, key.dtype={key.dtype}, "
+            f"and value.dtype={value.dtype}"
+        )
     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
 
     Bq, Hq, seq_len_q, qk_head_dim = query.shape
