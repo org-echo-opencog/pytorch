@@ -48,10 +48,14 @@ def _misc_patterns_init(input_device: Optional[torch.device] = None):
         )
 
     register_replacement(
+        # pyrefly: ignore [bad-argument-type]
         randperm_index_add_pattern,
+        # pyrefly: ignore [bad-argument-type]
         randperm_index_add_replacement,
         [torch.empty(4, 8, device=device), torch.empty(2, 8, device=device)],
+        # pyrefly: ignore [bad-argument-type]
         fwd_only,
+        # pyrefly: ignore [bad-argument-type]
         [post_grad_patterns, joint_graph_patterns],
         skip_duplicates=True,
     )
@@ -65,10 +69,14 @@ def _misc_patterns_init(input_device: Optional[torch.device] = None):
         return torch.ops.aten._unsafe_index(x, (index,)), index
 
     register_replacement(
+        # pyrefly: ignore [bad-argument-type]
         randperm_index_pattern,
+        # pyrefly: ignore [bad-argument-type]
         randperm_index_replacement,
         [torch.empty(4, 8, device=device)],
+        # pyrefly: ignore [bad-argument-type]
         fwd_only,
+        # pyrefly: ignore [bad-argument-type]
         [post_grad_patterns, joint_graph_patterns],
         scalar_workaround={"slice_shape": 42},
         skip_duplicates=True,
@@ -111,7 +119,7 @@ class NumpyCompatNormalization:
                 signatures = () if signatures is None else signatures
                 replaceable_kwargs = OrderedSet()
                 for sig in signatures:
-                    for param_name in sig.parameters.keys():
+                    for param_name in sig.parameters:
                         if param_name in self.numpy_compat:
                             replaceable_kwargs.update(self.numpy_compat[param_name])
 
